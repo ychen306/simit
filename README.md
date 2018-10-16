@@ -18,7 +18,7 @@ then build it:
     cd llvm3.7
     mkdir build
     cd build
-    cmake -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" -DLLVM_ENABLE_ASSERTIONS=ON -DCMAKE_BUILD_TYPE=Release ..
+    cmake -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_RTTI=ON -DCMAKE_BUILD_TYPE=Release ..
     make -j8
 
 then point Simit to it:
@@ -55,7 +55,7 @@ To check a Simit program:
 
 For example:
 
-    ./build/bin/simit-check simit-check apps/springs/isprings.sim
+    ./build/bin/simit-check apps/springs/isprings.sim
 
 To make the Simit bin directory part of your PATH:
 
