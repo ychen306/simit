@@ -10,6 +10,7 @@
 #include "taco/tensor.h"
 #include "taco/ir/ir_visitor.h"
 #include "taco/lower/lower.h"
+#include "taco/ir/ir.h"
 
 using namespace std;
 using namespace simit;
@@ -25,6 +26,15 @@ struct Hash {
     return (size_t) a.ptr;
   }
 };
+
+static bool isInt1(const taco::ir::Literal *L) {
+  auto type = L->type;
+  if (type.isInt())
+    return L->getIntValue() == 1;
+  if (type.isUInt())
+    return L->getUIntValue() == 1;
+  return false;
+}
 
 template <typename T, typename Func1, typename Func2, typename Callback>
 static void flattenIndices(const vector<T>& inputs, const Func1& getSizeFunc,
@@ -72,6 +82,7 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
   Ptr tacoAccess;
   unordered_map<IndexVar, vector<taco::IndexVar>, Hash<IndexVar>> indexMap;
   // IndexVar.indexDomain unpacks to array of indexSets, traversed column first,
+
   // and mapped to taco::IndexVar
 
   taco::TensorBase getTacoVar(Var var) {
@@ -80,7 +91,7 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
     const TensorType* type = var.getType().toTensor();
 
     vector<int> dimensions;
-    vector<taco::DimensionType> tacoSparsity;
+    vector<taco::ModeFormatPack> tacoSparsity;
     flattenIndices(type->getDimensions(),
         [](const IndexDomain& domain) { return domain.getNumIndexSets(); },
         [](const IndexDomain& domain) { return domain.getIndexSets(); },
@@ -89,7 +100,7 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
             dimensions.push_back((int) indexSet.getSize());
             tacoSparsity.push_back(taco::Dense);
           } else {
-            dimensions.push_back(1); // dummy dimension
+            dimensions.push_back(42); // dummy dimension
             tacoSparsity.push_back(taco::Sparse);
           }
         });
@@ -101,7 +112,16 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
 
     // for example A = A + A is treated with 3 different tensors
     string uniqueVarName = nameGenerator.getName(var.getName());
-    tacoTensor = taco::TensorBase(uniqueVarName, taco::ComponentType::Double,
+    ScalarType componentType = type->getComponentType();
+    taco::Datatype tacoComponentType;
+    if (componentType.isFloat()) {
+      tacoComponentType = taco::Float64;
+    } else if (componentType.isInt()) {
+      tacoComponentType = taco::Int32;
+    } else if (componentType.isComplex()) {
+      tacoComponentType = taco::Complex128;
+    }
+    tacoTensor = taco::TensorBase(uniqueVarName, tacoComponentType,
                                   dimensions, taco::Format(tacoSparsity));
     tensorNameMap[uniqueVarName] = var;
     return tacoTensor;
@@ -303,13 +323,18 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
 
   virtual void visit(const taco::ir::Literal* tacoOp) {
     if (tacoOp->type.isBool()) {
-      expr = Literal::make((bool)tacoOp->value);
-    } else if (tacoOp->type.isInt() || tacoOp->type.isUInt()) {
-      expr = Literal::make((int)tacoOp->value);
-    } else {
-      simit_iassert(tacoOp->type.isFloat());
-      expr = Literal::make(tacoOp->dbl_value);
-    }
+      expr = Literal::make(tacoOp->getBoolValue());
+    } else if (tacoOp->type.isInt()) {
+      expr = Literal::make((int)tacoOp->getIntValue());
+    } else if (tacoOp->type.isUInt()) {
+      expr = Literal::make((int)tacoOp->getUIntValue());
+    } else if (tacoOp->type.isFloat()) {
+      expr = Literal::make(tacoOp->getFloatValue());
+    } else if (tacoOp->type.isComplex()) {
+      auto val = tacoOp->getComplexValue();
+      expr = Literal::make(double_complex(val.real(), val.imag()));
+    } else
+      simit_unreachable;
   }
 
   virtual void visit(const taco::ir::Var* tacoOp) {
@@ -330,8 +355,17 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
         name = name.substr(0, name.rfind("_pos"));
         var = Var(name, Int);
       } else {
-        simit_iassert(tacoOp->type.isFloat());
-        var = Var(name, Float);
+        Type simitType;
+        if (tacoOp->type.isComplex())
+          simitType = Complex;
+        else if (tacoOp->type.isFloat())
+          simitType = Float;
+        else if (tacoOp->type.isInt())
+          simitType = Int;
+        else
+          simit_unreachable;
+
+        var = Var(name, simitType);
       }
       tacoLocalVars[tacoOp] = var;
     }
@@ -358,12 +392,6 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
     Expr a = compile(tacoOp->a);
     Expr b = compile(tacoOp->b);
     expr = Add::make(a, b);
-    if (isa<Literal>(a) && a.type() == Int && to<Literal>(a)->getIntVal(0) == 0) {
-      expr = b;
-    }
-    if (isa<Literal>(b) && b.type() == Int && to<Literal>(b)->getIntVal(0) == 0) {
-      expr = a;
-    }
   }
 
   virtual void visit(const taco::ir::Sub* tacoOp) {
@@ -376,10 +404,6 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
     Expr a = compile(tacoOp->a);
     Expr b = compile(tacoOp->b);
     expr = Mul::make(a, b);
-    if (isa<Literal>(a) && a.type() == Int && to<Literal>(a)->getIntVal(0) == 0
-     || isa<Literal>(b) && b.type() == Int && to<Literal>(b)->getIntVal(0) == 0) {
-      expr = 0;
-    }
   }
 
   virtual void visit(const taco::ir::Div* tacoOp) {
@@ -511,6 +535,34 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
     }
   }
 
+  virtual void visit(const taco::ir::BitOr*) override {
+    simit_unreachable;
+  }
+
+  virtual void visit(const taco::ir::Cast* cast) override {
+    taco::Datatype newType = cast->type;
+    taco::Datatype oldType = cast->a.type();
+    simit_iassert(oldType.isBool())
+      << "Cannot handle type-cast from " << oldType;
+    simit_iassert(newType.isUInt() || newType.isInt())
+      << "Cannot handle type-cast to " << newType;
+
+    Var temp(nameGenerator.getName(), Int);
+    Expr cond = compile(cast->a);
+    spill(IfThenElse::make(cond,
+          AssignStmt::make(temp, 1),
+          AssignStmt::make(temp, 0)));
+    expr = VarExpr::make(temp);
+  }
+
+  virtual void visit(const taco::ir::Switch*) override {
+    simit_unreachable;
+  }
+
+  virtual void visit(const taco::ir::VarDecl *decl) override {
+    taco::ir::Assign::make(decl->var, decl->rhs).accept(this);
+  }
+
   Expr generateTensorRead(Expr buffer, Expr index) {
     simit_iassert(buffer.type().isTensor());
     const TensorType* type = buffer.type().toTensor();
@@ -579,7 +631,8 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
 
     if (isScalar(buffer.type())) {
       if (isa<VarExpr>(buffer)) {
-        stmt = AssignStmt::make(to<VarExpr>(buffer)->var, value);
+        Var var = to<VarExpr>(buffer)->var;
+        stmt = AssignStmt::make(var, value);
       } else if (isa<TensorRead>(buffer)) {
         const TensorRead* t = to<TensorRead>(buffer);
         stmt = TensorWrite::make(t->tensor, t->indices, value);
@@ -616,7 +669,7 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
       const taco::ir::Literal* increment;
       if (taco::ir::isa<taco::ir::Literal>(tacoOp->increment) &&
           (increment = taco::ir::to<taco::ir::Literal>(tacoOp->increment),
-           !increment->type.isFloat() && increment->value == 1)) {
+           isInt1(increment))) {
         stmt = ForRange::make(loopVar, start, end, body);
       } else {
         Expr increment = compile(tacoOp->increment);
@@ -656,7 +709,7 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
     stmt = compile(tacoOp->body);
   }
 
-  virtual void visit(const taco::ir::VarAssign* tacoOp) {
+  virtual void visit(const taco::ir::Assign* tacoOp) {
     simit_iassert(taco::ir::isa<taco::ir::Var>(tacoOp->lhs));
     const taco::ir::Var* lhs = taco::ir::to<taco::ir::Var>(tacoOp->lhs);
 
@@ -738,7 +791,7 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
 
     switch (tacoOp->property) {
     case taco::ir::TensorProperty::Indices: {
-      simit_iassert(tacoOp->dimension == 0 || tacoOp->dimension == 1);
+      simit_iassert(tacoOp->mode == 0 || tacoOp->mode == 1);
       simit_iassert(storage->hasStorage(tensor));
       switch (tacoOp->index) {
       case 0:
@@ -753,7 +806,7 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
         not_supported_yet;
       }
     } break;
-    case taco::ir::TensorProperty::Dimensions: {      
+    case taco::ir::TensorProperty::Dimension: {      
       simit_iassert(tacoOp->index == 0);
       vector<IndexSet> indexSets;
       vector<IndexDomain> domains = expr.type().toTensor()->getDimensions();
@@ -762,10 +815,10 @@ class TacoLower : public IRVisitor, public taco::ir::IRVisitorStrict {
           [](const IndexDomain& domain) { return domain.getIndexSets(); },
           [&](const IndexSet& indexSet) { indexSets.push_back(indexSet); } );
 
-      if (indexSets[tacoOp->dimension].getKind() == IndexSet::Range) {
-        expr = Literal::make((int) indexSets[tacoOp->dimension].getSize());
+      if (indexSets[tacoOp->mode].getKind() == IndexSet::Range) {
+        expr = Literal::make((int) indexSets[tacoOp->mode].getSize());
       } else {
-        expr = Length::make(indexSets[tacoOp->dimension]);
+        expr = Length::make(indexSets[tacoOp->mode]);
       }
     } break;
     case taco::ir::TensorProperty::Values:
@@ -784,7 +837,7 @@ public:
     taco::ir::Stmt tacoFunc;
     try {
       tacoFunc =
-        taco::lower::lower(tacoAssignDest, "", {taco::lower::Compute});
+        taco::old::lower(tacoAssignDest.getAssignment(), "", {taco::old::Compute}, 2 << 20);
     } catch (...) {
       throw TacoException();
     }
@@ -995,6 +1048,33 @@ static bool isSparseFollowedByDense(Stmt stmt) {
 
 // Tensor has a diagonal or stencil storage. There's no represenation in taco
 static bool storageKindUnsupported(Stmt stmt, const Storage& storage) {
+  class CheckPathExpressionWithStencilLink : public pe::PathExpressionVisitor {
+    bool hasStencilLink = false;
+  public:
+    void visit(const pe::Link *pe) {
+      if (pe->hasStencil()) {
+        hasStencilLink = true;
+      }
+    }
+
+    virtual ~CheckPathExpressionWithStencilLink() {}
+
+    static bool check(const TensorStorage &ts) {
+      if (!ts.hasTensorIndex())
+        return false;
+
+      auto &pe = ts.getTensorIndex().getPathExpression();
+      if (!pe.defined())
+        return false;
+
+      CheckPathExpressionWithStencilLink checker;
+      pe.accept(&checker);
+      return checker.hasStencilLink;
+    }
+  };
+  
+  /////
+
   struct CheckStorageKind : public IRVisitor {
     bool value = false;
     const Storage& storage;
@@ -1004,7 +1084,10 @@ static bool storageKindUnsupported(Stmt stmt, const Storage& storage) {
     virtual void visit(const VarExpr* op) {
       if (storage.hasStorage(op->var)) {
         TensorStorage::Kind kind = storage.getStorage(op->var).getKind();
-        if (kind != TensorStorage::Dense && kind != TensorStorage::Indexed) {
+        if (kind != TensorStorage::Dense && kind != TensorStorage::Indexed ||
+            CheckPathExpressionWithStencilLink::check(storage.getStorage(op->var))) {
+          std::cerr << "Unsupported storage for " << op->var
+            << ": " << storage.getStorage(op->var) << '\n';
           value = true;
         }
       }
@@ -1013,7 +1096,10 @@ static bool storageKindUnsupported(Stmt stmt, const Storage& storage) {
     virtual void visit(const AssignStmt* op) {
       if (storage.hasStorage(op->var)) {
         TensorStorage::Kind kind = storage.getStorage(op->var).getKind();
-        if (kind != TensorStorage::Dense && kind != TensorStorage::Indexed) {
+        if (kind != TensorStorage::Dense && kind != TensorStorage::Indexed ||
+            CheckPathExpressionWithStencilLink::check(storage.getStorage(op->var))) {
+          std::cerr << "Unsupported storage for " << op->var
+            << ": " << storage.getStorage(op->var) << '\n';
           value = true;
         }
       }
@@ -1068,6 +1154,30 @@ static bool hasDivision(Stmt stmt) {
 }
 
 
+
+static bool tacoCannotHandle(Stmt stmt, const Storage &storage) {
+
+#define CHECK(x, msg) if (x) {\
+  std::cerr << "Warning: taco cannot handle " msg "\n"\
+  << util::toString(stmt) << "\n";\
+  return true;\
+}
+  
+  CHECK(isTranspose(stmt), "transpose");
+  CHECK(isSelfAssignmentWithDifferentIndices(stmt),
+      "self assignment with different indices");
+  CHECK(sparsityMismatch(stmt),
+      "same index var but different sparsity");
+  CHECK(isSparseFollowedByDense(stmt),
+      "sparse dimension followed by dense dimension");
+  CHECK(storageKindUnsupported(stmt, storage),
+      "diagonal or stencil storage");
+  CHECK(hasFixedIndexVar(stmt), "fixed index expression");
+  CHECK(hasDivision(stmt), "division");
+  return false;
+}
+
+
 Func simit::ir::lowerIndexExprTaco(Func func) {
   class : public IRRewriter {
     Storage storage;
@@ -1101,19 +1211,14 @@ Func simit::ir::lowerIndexExprTaco(Func func) {
 
       op.accept(&hasIndexVar);
       if (hasIndexVar.value) {
-        if (tacoCannotHandle(op)) {
-          // taco can't handle transpose yet
+        try {
+          stmt = TacoLower().rewrite(op, componentType, &storage);
+        } catch (const TacoException& e) {
+          std::cerr << "Warning: taco cannot handle (unknown reason)\n"
+            << util::toString(stmt) << "\n";
           stmt = lowerIndexExpression(op);
-        } else {
-          try {
-            stmt = TacoLower().rewrite(op, componentType, &storage);
-          } catch (const TacoException& e) {
-            std::cerr << "Warning: taco cannot handle (unknown reason)\n"
-                      << util::toString(stmt) << "\n";
-            stmt = lowerIndexExpression(op);
-          }
-          stmt = Comment::make(util::toString(op), stmt, false, true);
         }
+        stmt = Comment::make(util::toString(op), stmt, false, true);
       } else {
         stmt = op;
       }
@@ -1133,33 +1238,15 @@ Func simit::ir::lowerIndexExprTaco(Func func) {
 
     virtual void visit(const Func* op) {
       storage = op->getStorage();
-      environment =op->getEnvironment();
+      environment = op->getEnvironment();
       IRRewriter::visit(op);
       func.setStorage(storage);
     }
-
-
-    bool tacoCannotHandle(Stmt stmt) {
-#define CHECK(x, msg) if (x) {\
-    std::cerr << "Warning: taco cannot handle " msg "\n"\
-              << util::toString(stmt) << "\n";\
-    return true;\
-  }
-
-      CHECK(isTranspose(stmt), "transpose");
-      CHECK(isSelfAssignmentWithDifferentIndices(stmt),
-            "self assignment with different indices");
-      CHECK(sparsityMismatch(stmt),
-            "same index var but different sparsity");
-      CHECK(isSparseFollowedByDense(stmt),
-            "sparse dimension followed by dense dimension");
-      CHECK(storageKindUnsupported(stmt, storage),
-            "diagonal or stencil storage");
-      CHECK(hasFixedIndexVar(stmt), "fixed index expression");
-      CHECK(hasDivision(stmt), "division");
-      return false;
-    }
   } rewriter;
+
+  if (tacoCannotHandle(func.getBody(), func.getStorage())) {
+    return lowerIndexExpressions(func);
+  }
 
   func = rewriter.rewrite(func);
   func = insertVarDecls(func);

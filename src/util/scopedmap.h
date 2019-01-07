@@ -83,7 +83,6 @@ public:
         return scope.at(symbol);
       }
     }
-    assert(false);
     simit_ierror << "Attempting to load symbol " << symbol
            << " which is not in the symbol table";
     return scopes.begin()->begin()->second;  // silence warning
